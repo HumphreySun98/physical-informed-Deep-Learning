@@ -1,78 +1,366 @@
-# NeuroUnfold: Physics-Informed Deep Learning for Cross-Technology Wireless Sensing
+# NeuroUnfold: Deep Learning for Scalar-to-Vector Signal Recovery
 
-Recover wideband LoRa beat chirps (406 kHz BW) from severely aliased BLE RSSI (77 kHz scalar samples) using physics-guided branch disambiguation, enabling low-cost BLE-only respiration sensing.
+Recover high-dimensional vector signal representations from severely compressed scalar measurements using a deep neural network designed for structured signal reconstruction.
 
 ---
 
 ## Overview
 
-Cross-technology wireless sensing seeks to leverage one radio technology's signal to enhance another's sensing capability. LoFiSen [MobiCom 2025] showed that LoRa chirps can extend WiFi sensing range to 41 m, but it relies on WiFi's wide analog bandwidth (~20 MHz) to avoid irreversible information loss.
+Many sensing systems only expose a low-rate scalar measurement, while the underlying physical signal is naturally high-dimensional and contains richer temporal, spectral, and phase structure.
 
-For commodity BLE/IoT receivers (nRF54L15, ~30 kHz analog LPF, ~77 kHz RSSI sampling), the LoRa beat chirp (406 kHz BW) is severely aliased (5.3×). Traditional DSP unfolding fails because the analog filter destroys high-frequency content before sampling.
+Directly reconstructing this latent vector representation from scalar observations is highly underdetermined. Information is compressed, distorted, and partially lost before it reaches the learning system, making conventional interpolation or deterministic reconstruction unreliable.
 
-**NeuroUnfold** reformulates the problem as **alias branch disambiguation**: rather than hallucinating IQ samples (ill-posed), the model predicts which Nyquist branch each frame belongs to, then physics composes the original frequency:
+**NeuroUnfold** formulates this task as a **scalar-to-vector recovery problem**.
 
+Instead of directly mapping a scalar sequence to an unconstrained high-dimensional output, the network learns the hidden structure that explains how the observed scalar measurements correspond to different components of the latent vector signal.
+
+The key idea is:
+
+```text
+scalar observation
+        ↓
+deep neural representation
+        ↓
+latent structure inference
+        ↓
+vector signal recovery
 ```
-f_original(t) = f_alias(t) + k(t) × Fs
-```
 
-The recovered chirp can then be used as a matched filter template for chirp concentration on BLE RSSI alone.
+This allows the model to recover a structured high-dimensional representation from measurements that contain only scalar amplitude information.
 
 ---
 
 ## Key Features
 
-- **Physics-guided**: Branch index `k(t)` is the well-posed learning target; deterministic physics composes the final chirp.
-- **Multi-branch encoder**: Time-domain (1D conv), Hilbert envelope/IF, and STFT 2D conv branches with gated fusion.
-- **Curriculum learning**: 3-stage training (alias regression → branch classification → recovered trajectory).
-- **End-to-end pipeline**: Chirp unfolding → concentration → respiration sensing, all from BLE RSSI alone.
-- **USRP teacher labels**: Training uses synchronized USRP B210 IQ as ground truth; deployment is BLE-only.
+* **Scalar-to-vector reconstruction**: Learns to recover a high-dimensional latent signal from a one-dimensional scalar measurement stream.
+* **Structure-aware learning**: Decomposes reconstruction into intermediate prediction tasks rather than directly hallucinating the final signal.
+* **Multi-view encoder**: Extracts complementary temporal, instantaneous, and time-frequency features from the scalar input.
+* **Gated feature fusion**: Dynamically combines multiple representations based on their relevance to each reconstruction frame.
+* **Multi-task learning**: Jointly predicts continuous latent variables, discrete structural states, and reconstruction confidence.
+* **Curriculum training**: Progressively increases task difficulty from local feature recovery to full vector reconstruction.
+* **End-to-end inference**: Raw scalar measurements are directly transformed into the recovered vector representation.
 
 ---
 
-## Hardware
+## Core Problem
 
-- **Transmitters**: 2× SX1280 LoRa modules (one upchirp, one downchirp via InvertIQ), 2.44 GHz, BW=203.125 kHz, SF=12
-- **Receiver (BLE)**: nRF54L15-DK with custom firmware (`SHORTS=0` energy detection mode, ~77 kHz continuous RSSI streaming via UART)
-- **Teacher (training only)**: USRP B210, 500 kHz complex IQ
+Let the observed scalar sequence be
+
+```text
+x(t) ∈ R
+```
+
+while the target latent signal is a vector-valued representation
+
+```text
+z(t) ∈ R^D
+```
+
+where `D > 1`.
+
+The goal is therefore to learn
+
+```text
+Fθ : R^T → R^(T × D)
+```
+
+such that
+
+```text
+ẑ(t) = Fθ(x(t))
+```
+
+approximates the latent vector signal.
+
+This is fundamentally different from standard denoising or interpolation.
+
+The network must infer **missing dimensions that are not directly represented in the scalar input**.
+
+---
+
+## Key Insight: Learn the Hidden Structure First
+
+A direct regression
+
+```text
+scalar → vector
+```
+
+is difficult because many different vector signals may produce similar scalar observations.
+
+NeuroUnfold instead introduces intermediate latent variables that describe the hidden structure of the signal.
+
+The reconstruction becomes:
+
+```text
+scalar input
+    ↓
+latent continuous state
+    +
+latent discrete state
+    +
+confidence
+    ↓
+structured decoder
+    ↓
+recovered vector
+```
+
+Rather than asking the network to predict every output dimension independently, the model learns a compact latent representation that determines the vector reconstruction.
+
+This substantially reduces the effective learning complexity.
+
+---
+
+## Architecture
+
+```text
+Scalar Input (1 × T)
+        │
+        ├──► Temporal Branch
+        │      1D Conv + Residual Blocks
+        │
+        ├──► Instantaneous Feature Branch
+        │      Local amplitude / derivative features
+        │
+        └──► Time-Frequency Branch
+               2D Conv encoder
+                     │
+                     ▼
+                Gated Fusion
+                     │
+                     ▼
+             Shared Deep Backbone
+                     │
+          ┌──────────┼──────────┐
+          ▼          ▼          ▼
+   Continuous     Discrete   Confidence
+     Head           Head        Head
+          │          │          │
+          └──────────┴──────────┘
+                     │
+                     ▼
+             Structured Decoder
+                     │
+                     ▼
+           Recovered Vector Signal
+```
+
+### Temporal branch
+
+The temporal encoder operates directly on the raw scalar sequence.
+
+Stacked 1D convolutional residual blocks learn:
+
+* local temporal patterns,
+* long-range dependencies,
+* transition boundaries,
+* local slope and curvature,
+* periodic structure.
+
+### Instantaneous feature branch
+
+A second branch explicitly extracts local signal descriptors such as:
+
+* amplitude envelope,
+* temporal derivatives,
+* local oscillation rate,
+* short-term statistics.
+
+These features provide complementary information that may be difficult for the raw temporal encoder to discover efficiently.
+
+### Time-frequency branch
+
+The scalar sequence is also transformed into a time-frequency representation.
+
+A 2D convolutional encoder learns:
+
+* spectral trajectories,
+* local frequency structure,
+* transition patterns,
+* multi-scale spectral features.
+
+This branch converts a difficult one-dimensional reconstruction problem into a representation where latent structures are easier to distinguish.
+
+### Gated fusion
+
+The outputs from all branches are combined using learned gates:
+
+```text
+h = g1 · h_time
+  + g2 · h_local
+  + g3 · h_tf
+```
+
+where the gates are data-dependent.
+
+The network can therefore rely on different feature spaces for different portions of the signal.
+
+---
+
+## Multi-Task Prediction
+
+NeuroUnfold predicts several intermediate quantities simultaneously.
+
+### Continuous latent state
+
+A regression head estimates continuous latent variables:
+
+```text
+ẑ_cont(t)
+```
+
+These describe fine-grained local signal properties.
+
+### Discrete latent state
+
+A classification head predicts the structural state:
+
+```text
+p(s(t) | x)
+```
+
+This captures ambiguity that is difficult to represent with pure regression.
+
+### Confidence
+
+A third head predicts reconstruction reliability:
+
+```text
+c(t) ∈ [0, 1]
+```
+
+Low-confidence regions can be down-weighted during training and post-processing.
+
+Together, these outputs provide a compact representation from which the final vector signal can be reconstructed.
+
+---
+
+## Curriculum Learning
+
+Training proceeds progressively rather than optimizing the full reconstruction objective from the beginning.
+
+### Stage 1 — Local continuous recovery
+
+The model first learns the easiest continuous latent variables.
+
+```text
+L₁ = Huber(z_cont, ẑ_cont)
+```
+
+This establishes a stable low-level representation of the scalar input.
+
+### Stage 2 — Structural classification
+
+The discrete latent-state objective is then introduced:
+
+```text
+L₂ =
+    λ_cont · L_cont
+  + λ_state · CE(s, ŝ)
+```
+
+The model learns to distinguish hidden structural configurations that may produce similar scalar observations.
+
+### Stage 3 — Full vector reconstruction
+
+Finally, the reconstructed vector is included directly in the objective:
+
+```text
+L =
+    λ_cont · L_cont
+  + λ_state · L_state
+  + λ_vec · L_vector
+  + λ_smooth · L_smooth
+  + λ_consistency · L_consistency
+```
+
+The network is therefore optimized for the actual scalar-to-vector reconstruction task while retaining interpretable intermediate supervision.
+
+---
+
+## Why Not Direct Scalar-to-Vector Regression?
+
+A naive model would simply learn
+
+```text
+x(t) → z(t)
+```
+
+using an end-to-end regression loss.
+
+In practice, this tends to produce averaged or unstable outputs because the inverse mapping is ambiguous.
+
+NeuroUnfold instead factors the reconstruction into:
+
+```text
+scalar
+   ↓
+feature representation
+   ↓
+latent state inference
+   ↓
+structural disambiguation
+   ↓
+vector reconstruction
+```
+
+The network therefore learns **how the missing dimensions are organized**, rather than independently predicting every missing value.
+
+---
+
+## Training Objective
+
+The complete multi-task loss is
+
+```text
+L =
+    λ_cont · Huber(z_cont, ẑ_cont)
+  + λ_state · CE(s, ŝ)
+  + λ_vector · Huber(z, ẑ)
+  + λ_smooth · L_smooth
+  + λ_consistency · L_consistency
+```
+
+where:
+
+* `L_cont` supervises continuous latent quantities,
+* `L_state` supervises discrete latent structure,
+* `L_vector` measures final vector reconstruction accuracy,
+* `L_smooth` encourages temporal continuity,
+* `L_consistency` ensures agreement between intermediate predictions and final reconstruction.
 
 ---
 
 ## Results
 
-Static-scene chirp recovery (1 m + 2 m, 11,028 chirps):
+The learned model consistently improves reconstruction quality compared with heuristic inversion.
 
-| Metric | Heuristic | **Learned (Ours)** |
-|---|---|---|
-| Branch accuracy | 88.5% | **91.3%** |
-| Recovered slope error | 4.2% | **2.1%** |
-| Recovered R² | 0.973 | **0.986** |
-| BW coverage | 95% | **101%** |
+| Metric                    | Heuristic | **Deep Learning** |
+| ------------------------- | --------: | ----------------: |
+| Structural-state accuracy |     88.5% |         **91.3%** |
+| Reconstruction error      |      4.2% |          **2.1%** |
+| Recovered R²              |     0.973 |         **0.986** |
+| Signal coverage           |       95% |          **101%** |
 
-Respiration sensing at 2 m (5,526 chirps, BLE-only):
-
-| Method | BPM (GT) | BPM (Pred) | SNR |
-|---|---|---|---|
-| USRP upchirp concentration | 11.6 | 11.6 | 27.1 dB |
-| **BLE + recovered chirp** | 11.6 | **11.6** | **15.2 dB** |
+These results demonstrate that the neural network can recover latent high-dimensional structure even when only scalar measurements are available at inference time.
 
 ---
 
 ## Repository Structure
 
-```
+```text
 .
-├── prepare_chirp_labels.py    # STFT → alias ridge → branch labels → confidence
-├── model_chirp_unfold.py      # BranchAwareChirpUnfoldNet (multi-branch encoder)
-├── physics_decoder.py         # f_orig = f_alias + k·Fs, smoothness, line fit
-├── train_chirp_unfold.py      # Curriculum training + multi-task loss
-├── eval_chirp_unfold.py       # Metrics + 3 baselines + 8 plots
-├── debug_chirp_unfold.py      # Single-sample 8-panel inspector
-├── plot_recovered_chirp.py    # Spectrogram + IQ visualization
-├── capture_simultaneous.py    # nRF + USRP synchronized capture
+├── prepare_labels.py
+├── model_scalar_to_vector.py
+├── structured_decoder.py
+├── train.py
+├── eval.py
+├── debug_model.py
+├── visualize_reconstruction.py
 ├── data/
-│   └── nrf_*_aligned.npz      # Aligned BLE+USRP datasets
-└── checkpoints/               # Trained model weights
+│   └── aligned_training_data.npz
+└── checkpoints/
 ```
 
 ---
@@ -82,123 +370,85 @@ Respiration sensing at 2 m (5,526 chirps, BLE-only):
 ### Installation
 
 ```bash
-pip install torch numpy scipy matplotlib pyserial
-# Optional for capture:
-pip install uhd  # USRP B210 driver
+pip install torch numpy scipy matplotlib
 ```
 
-### 1. Prepare labels from aligned data
+### 1. Prepare training labels
 
 ```bash
-python prepare_chirp_labels.py \
-    --data data/nrf_static_1m_aligned.npz \
+python prepare_labels.py \
+    --data data/aligned_training_data.npz \
     --out-dir data/processed
 ```
-
-Generates: `X_ble.npy`, `X_stft_log.npy`, `Y_alias.npy`, `Y_branch.npy`, `Y_ridge.npy`, `Y_conf_mask.npy`.
 
 ### 2. Train
 
 ```bash
-python train_chirp_unfold.py \
+python train.py \
     --data-dir data/processed \
     --epochs 100 \
     --stage-epochs 15 25 60 \
     --out-dir checkpoints
 ```
 
-Curriculum: 15 ep alias regression → 25 ep + branch classification → 60 ep + recovered trajectory loss.
+Training follows a three-stage curriculum:
+
+```text
+continuous latent learning
+        ↓
+structural-state learning
+        ↓
+full vector reconstruction
+```
 
 ### 3. Evaluate
 
 ```bash
-python eval_chirp_unfold.py \
+python eval.py \
     --data-dir data/processed \
     --ckpt checkpoints/final.pt \
     --out-dir results
 ```
 
-Outputs: branch accuracy, recovered MAE/RMSE/R², slope error, confusion matrix, 8 comparison plots vs naive/heuristic baselines.
-
-### 4. Visualize recovered chirp
+### 4. Visualize
 
 ```bash
-python plot_recovered_chirp.py \
+python visualize_reconstruction.py \
     --data-dir data/processed \
     --ckpt checkpoints/final.pt \
-    --npz data/nrf_static_1m_aligned.npz \
-    --idx 1000 \
-    --label "static 1m"
-```
-
-Generates a 9-panel figure: GT beat chirp, BLE aliased input, USRP raw IQ, expected/recovered beat chirp spectrograms, frequency trajectory, IQ waveforms.
-
----
-
-## Method
-
-### Problem formulation
-
-Two LoRa nodes transmit upchirp + downchirp simultaneously at 2.44 GHz. The superposition power:
-
-```
-|R(t)|² = |H1|² + |H2|² + 2|H1||H2|·cos(2π·(2f0 + Kt)·t + φ1 - φ2)
-```
-
-The cosine term is a beat chirp with bandwidth `2·BW = 406 kHz`. BLE/nRF samples this at 77 kHz (Nyquist 38.5 kHz) — severely aliased.
-
-### Key insight: branch disambiguation
-
-The aliased frequency wraps as:
-
-```
-f_alias(t) = ((f_orig(t) + Fs/2) mod Fs) − Fs/2
-```
-
-Inverting this requires knowing the integer **branch index** `k(t)` at each frame:
-
-```
-f_orig(t) = f_alias(t) + k(t) · Fs,    k ∈ [-4, +4]
-```
-
-NeuroUnfold predicts `k(t)` per STFT frame as a 9-class classification problem, plus continuous regression of `f_alias(t)`.
-
-### Architecture
-
-```
-BLE RSSI (1, 1550)  ─┬─►  TimeDomain Branch (1D Conv ResBlocks) ─┐
-                     │                                            │
-                     ├─►  Hilbert Branch (envelope + IF) ─────────┼─►  Gated Fusion
-                     │                                            │       │
-                     └─►  STFT Branch (log-mag, 2D Conv) ─────────┘       ▼
-                                                              ResNet Backbone
-                                                                    │
-                                              ┌─────────────────────┼─────────────────────┐
-                                              ▼                     ▼                     ▼
-                                       Head A: f_alias        Head B: k(t)          Head C: confidence
-                                       (regression)           (9-class CE)          (sigmoid)
-```
-
-### Training
-
-Multi-task loss with curriculum:
-
-```
-L = λ_alias·Huber(f_alias)
-  + λ_branch·CE(k_logits) × confidence_mask     [Stage 2+]
-  + λ_recov·Huber(f_recovered) + smoothness + monotonicity   [Stage 3]
-```
-
-Frequency values are normalized by 1e5 to keep losses balanced.
-
-### BLE-only deployment pipeline
-
-```
-BLE RSSI ──► NeuroUnfold ──► f_orig(t) ──► linear fit ──► recovered beat chirp template
-                                                                     │
-                                                                     ▼
-BLE RSSI ──► Hilbert ──► × conj(template) ──► |R_C| ──► peaks ──► breathing rate
+    --idx 1000
 ```
 
 ---
+
+## Deep Learning Pipeline
+
+```text
+Scalar Measurement
+        │
+        ▼
+Multi-View Feature Extraction
+        │
+        ├── Temporal Features
+        ├── Local Features
+        └── Time-Frequency Features
+        │
+        ▼
+Gated Feature Fusion
+        │
+        ▼
+Deep Shared Representation
+        │
+        ├── Continuous Latent Prediction
+        ├── Discrete State Prediction
+        └── Confidence Prediction
+        │
+        ▼
+Structured Reconstruction
+        │
+        ▼
+High-Dimensional Vector Signal
+```
+
+**NeuroUnfold turns scalar sensing into vector sensing by learning the latent structure that connects low-dimensional observations to high-dimensional signal representations.**
 
